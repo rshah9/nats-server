@@ -75,6 +75,9 @@ const (
 	wsFinalFrame        = true
 	wsCompressedFrame   = true
 	wsUncompressedFrame = false
+
+	wsSchemePrefix    = "ws"
+	wsSchemePrefixTLS = "wss"
 )
 
 var decompressorPool sync.Pool
@@ -113,6 +116,7 @@ type allowedOrigin struct {
 type wsUpgradeResult struct {
 	conn net.Conn
 	ws   *websocket
+	kind int
 }
 
 type wsReadInfo struct {
@@ -120,6 +124,7 @@ type wsReadInfo struct {
 	fs    bool
 	ff    bool
 	fc    bool
+	nm    bool // no mask (for LEAF connections)
 	mkpos byte
 	mkey  [4]byte
 	buf   []byte
@@ -188,7 +193,7 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 			b1 := tmpBuf[0]
 
 			// Clients MUST set the mask bit. If not set, reject.
-			if b1&wsMaskBit == 0 {
+			if !r.nm && b1&wsMaskBit == 0 {
 				return bufs, c.wsHandleProtocolError("mask bit missing")
 			}
 
@@ -236,13 +241,15 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 				r.rem = int(binary.BigEndian.Uint64(tmpBuf))
 			}
 
-			// Read masking key
-			tmpBuf, pos, err = wsGet(ior, buf, pos, 4)
-			if err != nil {
-				return bufs, err
+			if !r.nm {
+				// Read masking key
+				tmpBuf, pos, err = wsGet(ior, buf, pos, 4)
+				if err != nil {
+					return bufs, err
+				}
+				copy(r.mkey[:], tmpBuf)
+				r.mkpos = 0
 			}
-			copy(r.mkey[:], tmpBuf)
-			r.mkpos = 0
 
 			// Handle control messages in place...
 			if wsIsControlFrame(frameType) {
@@ -272,7 +279,9 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 				b = r.buf
 			}
 			if !r.fc || r.rem == 0 {
-				r.unmask(b)
+				if !r.nm {
+					r.unmask(b)
+				}
 				if r.fc {
 					// As per https://tools.ietf.org/html/rfc7692#section-7.2.2
 					// add 0x00, 0x00, 0xff, 0xff and then a final block so that flate reader
@@ -314,7 +323,9 @@ func (c *client) wsHandleControlFrame(r *wsReadInfo, frameType wsOpCode, nc io.R
 		if err != nil {
 			return pos, err
 		}
-		r.unmask(payload)
+		if !r.nm {
+			r.unmask(payload)
+		}
 		r.rem = 0
 	}
 	switch frameType {
@@ -522,6 +533,14 @@ func wsCreateCloseMessage(status int, body string) []byte {
 // will be used to create a *client object.
 // Invoked from the HTTP server listening on websocket port.
 func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeResult, error) {
+	kind := CLIENT
+	if r.URL != nil {
+		ep := r.URL.EscapedPath()
+		if strings.HasPrefix(ep, leafNodeWSPath) {
+			kind = LEAF
+		}
+	}
+
 	opts := s.getOpts()
 
 	// From https://tools.ietf.org/html/rfc6455#section-4.2.1
@@ -598,16 +617,18 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 		conn.SetDeadline(time.Time{})
 	}
 	ws := &websocket{compress: compress}
-	// Indicate if this is likely coming from a browser.
-	if ua := r.Header.Get("User-Agent"); ua != "" && strings.HasPrefix(ua, "Mozilla/") {
-		ws.browser = true
-	}
-	if opts.Websocket.JWTCookie != "" {
-		if c, err := r.Cookie(opts.Websocket.JWTCookie); err == nil && c != nil {
-			ws.cookieJwt = c.Value
+	if kind == CLIENT {
+		// Indicate if this is likely coming from a browser.
+		if ua := r.Header.Get("User-Agent"); ua != "" && strings.HasPrefix(ua, "Mozilla/") {
+			ws.browser = true
+		}
+		if opts.Websocket.JWTCookie != "" {
+			if c, err := r.Cookie(opts.Websocket.JWTCookie); err == nil && c != nil {
+				ws.cookieJwt = c.Value
+			}
 		}
 	}
-	return &wsUpgradeResult{conn: conn, ws: ws}, nil
+	return &wsUpgradeResult{conn: conn, ws: ws, kind: kind}, nil
 }
 
 // Returns true if the header named `name` contains a token with value `value`.
@@ -841,11 +862,11 @@ func (s *Server) startWebsocketServer() {
 	// user has configured NoTLS because otherwise the server would have failed
 	// to start due to options validation.
 	if o.TLSConfig != nil {
-		proto = "wss"
+		proto = wsSchemePrefixTLS
 		config := o.TLSConfig.Clone()
 		hl, err = tls.Listen("tcp", hp, config)
 	} else {
-		proto = "ws"
+		proto = wsSchemePrefix
 		hl, err = net.Listen("tcp", hp)
 	}
 	if err != nil {
@@ -854,7 +875,7 @@ func (s *Server) startWebsocketServer() {
 		return
 	}
 	s.Noticef("Listening for websocket clients on %s://%s:%d", proto, o.Host, port)
-	if proto == "ws" {
+	if proto == wsSchemePrefix {
 		s.Warnf("Websocket not configured with TLS. DO NOT USE IN PRODUCTION!")
 	}
 
@@ -862,7 +883,6 @@ func (s *Server) startWebsocketServer() {
 	if port == 0 {
 		s.opts.Websocket.Port = hl.Addr().(*net.TCPAddr).Port
 	}
-	s.Noticef("Listening for websocket clients on %s://%s:%d", proto, o.Host, port)
 	s.websocket.connectURLs, err = s.getConnectURLs(o.Advertise, o.Host, o.Port)
 	if err != nil {
 		s.Fatalf("Unable to get websocket connect URLs: %v", err)
@@ -870,6 +890,7 @@ func (s *Server) startWebsocketServer() {
 		s.mu.Unlock()
 		return
 	}
+	hasLeaf := sopts.LeafNode.Port != 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		res, err := s.wsUpgrade(w, r)
@@ -877,7 +898,20 @@ func (s *Server) startWebsocketServer() {
 			s.Errorf(err.Error())
 			return
 		}
-		s.createWSClient(res.conn, res.ws)
+		switch res.kind {
+		case CLIENT:
+			s.createWSClient(res.conn, res.ws)
+		case LEAF:
+			if !hasLeaf {
+				s.Errorf("Not configured to accept leaf node connections")
+				// Silently close for now. If we want to send an error back, we would
+				// need to create the leafnode client anyway, so that is is handling websocket
+				// frames, then send the error to the remote.
+				res.conn.Close()
+				return
+			}
+			s.createLeafNode(res.conn, nil, nil, res.ws)
+		}
 	})
 	hs := &http.Server{
 		Addr:        hp,
@@ -1133,4 +1167,8 @@ func (c *client) wsCollapsePtoNB() (net.Buffers, int64) {
 	}
 	c.ws.frames = nil
 	return bufs, c.ws.fs
+}
+
+func isWSURL(u *url.URL) bool {
+	return strings.HasPrefix(strings.ToLower(u.Scheme), wsSchemePrefix)
 }

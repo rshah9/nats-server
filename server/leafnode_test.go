@@ -15,10 +15,12 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -28,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 )
 
@@ -2292,4 +2295,371 @@ func TestLeafNodeTLSConfigReloadForRemote(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestLeafNodeWSMixURLs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		urls []string
+	}{
+		{"mix 1", []string{"nats://127.0.0.1:1234", "ws://127.0.0.1:5678", "wss://127.0.0.1:9012"}},
+		{"mix 2", []string{"ws://127.0.0.1:1234", "nats://127.0.0.1:5678", "wss://127.0.0.1:9012"}},
+		{"mix 3", []string{"wss://127.0.0.1:1234", "ws://127.0.0.1:5678", "nats://127.0.0.1:9012"}},
+		{"mix 4", []string{"ws://127.0.0.1:1234", "nats://127.0.0.1:9012"}},
+		{"mix 5", []string{"nats://127.0.0.1:1234", "ws://127.0.0.1:9012"}},
+		{"mix 6", []string{"wss://127.0.0.1:1234", "nats://127.0.0.1:9012"}},
+		{"mix 7", []string{"nats://127.0.0.1:1234", "wss://127.0.0.1:9012"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := DefaultOptions()
+			remote := &RemoteLeafOpts{}
+			urls := make([]*url.URL, 0, 3)
+			for _, ustr := range test.urls {
+				u, err := url.Parse(ustr)
+				if err != nil {
+					t.Fatalf("Error parsing url: %v", err)
+				}
+				urls = append(urls, u)
+			}
+			remote.URLs = urls
+			o.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+			s, err := NewServer(o)
+			if err == nil || !strings.Contains(err.Error(), "mix") {
+				if s != nil {
+					s.Shutdown()
+				}
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestLeafNodeWSBasic(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		tls               bool
+		acceptCompression bool
+		remoteCompression bool
+	}{
+		{"plain no compression", false, false, false},
+		{"plain compression", false, true, true},
+		{"plain compression disagree", false, false, true},
+		{"plain compression disagree 2", false, true, false},
+		{"tls no compression", true, false, false},
+		{"tls compression", true, true, true},
+		{"tls compression disagree", true, false, true},
+		{"tls compression disagree 2", true, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := DefaultOptions()
+			o.Websocket.Host = "127.0.0.1"
+			o.Websocket.Port = -1
+			o.Websocket.NoTLS = !test.tls
+			if test.tls {
+				tc := &TLSConfigOpts{
+					CertFile: "../test/configs/certs/server-cert.pem",
+					KeyFile:  "../test/configs/certs/server-key.pem",
+					CaFile:   "../test/configs/certs/ca.pem",
+				}
+				tlsConf, err := GenTLSConfig(tc)
+				if err != nil {
+					t.Fatalf("Error generating TLS config: %v", err)
+				}
+				o.Websocket.TLSConfig = tlsConf
+			}
+			o.Websocket.Compression = test.acceptCompression
+			o.LeafNode.Host = "127.0.0.1"
+			o.LeafNode.Port = -1
+			s := RunServer(o)
+			defer s.Shutdown()
+
+			// Use some path in the URL.. we don't use that, but internally
+			// the server will prefix the path with /leafnode so that the
+			// WS webserver knows that it needs to create a LEAF connection.
+			u, _ := url.Parse(fmt.Sprintf("ws://127.0.0.1:%d/some/path", o.Websocket.Port))
+			lo := DefaultOptions()
+			lo.Cluster.Name = "LN"
+			remote := &RemoteLeafOpts{URLs: []*url.URL{u}}
+			if test.tls {
+				tc := &TLSConfigOpts{
+					CertFile: "../test/configs/certs/server-cert.pem",
+					KeyFile:  "../test/configs/certs/server-key.pem",
+					CaFile:   "../test/configs/certs/ca.pem",
+				}
+				tlsConf, err := GenTLSConfig(tc)
+				if err != nil {
+					t.Fatalf("Error generating TLS config: %v", err)
+				}
+				// GenTLSConfig sets the CA in ClientCAs, but since here we act
+				// as a client, set RootCAs...
+				tlsConf.RootCAs = tlsConf.ClientCAs
+				remote.TLSConfig = tlsConf
+			}
+			lo.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+			// TODO: Should this be a leaf node remote's option?
+			lo.Websocket.Compression = test.remoteCompression
+			ln := RunServer(lo)
+			defer ln.Shutdown()
+
+			checkLeafNodeConnected(t, s)
+			checkLeafNodeConnected(t, ln)
+
+			nc1 := natsConnect(t, s.ClientURL())
+			defer nc1.Close()
+			sub1 := natsSubSync(t, nc1, "foo")
+			natsFlush(t, nc1)
+
+			checkSubInterest(t, ln, globalAccountName, "foo", time.Second)
+
+			nc2 := natsConnect(t, ln.ClientURL())
+			msg1Payload := make([]byte, 128)
+			for i := 0; i < len(msg1Payload); i++ {
+				msg1Payload[i] = 'A'
+			}
+			natsPub(t, nc2, "foo", msg1Payload)
+
+			msg := natsNexMsg(t, sub1, time.Second)
+			if !bytes.Equal(msg.Data, msg1Payload) {
+				t.Fatalf("Invalid message: %q", msg.Data)
+			}
+
+			sub2 := natsSubSync(t, nc2, "bar")
+			natsFlush(t, nc2)
+
+			checkSubInterest(t, s, globalAccountName, "bar", time.Second)
+
+			msg2Payload := make([]byte, 128)
+			for i := 0; i < len(msg2Payload); i++ {
+				msg2Payload[i] = 'B'
+			}
+			natsPub(t, nc1, "bar", msg2Payload)
+
+			msg = natsNexMsg(t, sub2, time.Second)
+			if !bytes.Equal(msg.Data, msg2Payload) {
+				t.Fatalf("Invalid message: %q", msg.Data)
+			}
+		})
+	}
+}
+
+func TestLeafNodeWSFailedConnection(t *testing.T) {
+	o := DefaultOptions()
+	o.Websocket.Host = "127.0.0.1"
+	o.Websocket.Port = -1
+	o.Websocket.NoTLS = true
+	o.LeafNode.Host = "127.0.0.1"
+	o.LeafNode.Port = -1
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	u, _ := url.Parse(fmt.Sprintf("ws://127.0.0.1:%d", o.Websocket.Port))
+	lo := DefaultOptions()
+	lo.Cluster.Name = "LN"
+	remote := &RemoteLeafOpts{URLs: []*url.URL{u}}
+	tc := &TLSConfigOpts{
+		CertFile: "../test/configs/certs/server-cert.pem",
+		KeyFile:  "../test/configs/certs/server-key.pem",
+		CaFile:   "../test/configs/certs/ca.pem",
+	}
+	tlsConf, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating TLS config: %v", err)
+	}
+	// GenTLSConfig sets the CA in ClientCAs, but since here we act
+	// as a client, set RootCAs...
+	tlsConf.RootCAs = tlsConf.ClientCAs
+	remote.TLSConfig = tlsConf
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{remote}
+	lo.LeafNode.ReconnectInterval = 100 * time.Millisecond
+	ln := RunServer(lo)
+	defer ln.Shutdown()
+
+	el := &captureErrorLogger{errCh: make(chan string, 100)}
+	ln.SetLogger(el, false, false)
+
+	select {
+	case err := <-el.errCh:
+		if !strings.Contains(err, "handshake error") {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("No error reported!")
+	}
+	ln.Shutdown()
+	s.Shutdown()
+
+	lst, err := natsListen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error starting listener: %v", err)
+	}
+	defer lst.Close()
+
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < 10; i++ {
+			c, err := lst.Accept()
+			if err != nil {
+				return
+			}
+			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+			if rand.Intn(2) == 1 {
+				c.Write([]byte("something\r\n"))
+			}
+			c.Close()
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	port := lst.Addr().(*net.TCPAddr).Port
+	u, _ = url.Parse(fmt.Sprintf("ws://127.0.0.1:%d", port))
+	lo = DefaultOptions()
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	lo.LeafNode.ReconnectInterval = 10 * time.Millisecond
+	ln, _ = NewServer(lo)
+	el = &captureErrorLogger{errCh: make(chan string, 100)}
+	ln.SetLogger(el, false, false)
+
+	go func() {
+		ln.Start()
+		wg.Done()
+	}()
+
+	timeout := time.NewTimer(time.Second)
+	for i := 0; i < 10; i++ {
+		select {
+		case err := <-el.errCh:
+			if !strings.Contains(err, "Error soliciting") {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		case <-timeout.C:
+			t.Fatal("No error reported!")
+		}
+	}
+	ln.Shutdown()
+	lst.Close()
+	wg.Wait()
+}
+
+func TestLeafNodeWSAuth(t *testing.T) {
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		port: -1
+		authorization {
+			users [
+				{user: "user", pass: "puser", connection_types: ["%s"]}
+				{user: "leaf", pass: "pleaf", connection_types: ["%s"]}
+			]
+		}
+		websocket {
+			port: -1
+			no_tls: true
+		}
+		leafnodes {
+			port: -1
+		}
+	`, jwt.ConnectionTypeStandard, jwt.ConnectionTypeLeafnode)))
+	defer os.Remove(conf)
+	o, err := ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	o.NoLog, o.NoSigs = true, true
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	u, err := url.Parse(fmt.Sprintf("ws://leaf:pleaf@127.0.0.1:%d", o.Websocket.Port))
+	if err != nil {
+		t.Fatalf("Error parsing url: %v", err)
+	}
+	lo := DefaultOptions()
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	lo.Cluster.Name = "LN"
+	ln := RunServer(lo)
+	defer ln.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+	checkLeafNodeConnected(t, ln)
+
+	nc1 := natsConnect(t, fmt.Sprintf("nats://user:puser@127.0.0.1:%d", o.Port))
+	defer nc1.Close()
+
+	sub := natsSubSync(t, nc1, "foo")
+	natsFlush(t, nc1)
+
+	checkSubInterest(t, ln, globalAccountName, "foo", time.Second)
+
+	nc2 := natsConnect(t, ln.ClientURL())
+	defer nc2.Close()
+
+	natsPub(t, nc2, "foo", []byte("msg1"))
+	msg := natsNexMsg(t, sub, time.Second)
+
+	if md := string(msg.Data); md != "msg1" {
+		t.Fatalf("Invalid message: %q", md)
+	}
+}
+
+func TestLeafNodeWSGossip(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.Websocket.Host = "127.0.0.1"
+	o1.Websocket.Port = -1
+	o1.Websocket.NoTLS = true
+	o1.LeafNode.Host = "127.0.0.1"
+	o1.LeafNode.Port = -1
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	// Now connect from a server that knows only about s1
+	lo := DefaultOptions()
+	lo.Cluster.Name = "LN"
+	u, _ := url.Parse(fmt.Sprintf("ws://127.0.0.1:%d", o1.Websocket.Port))
+	lo.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	lo.LeafNode.ReconnectInterval = 15 * time.Millisecond
+	ln := RunServer(lo)
+	defer ln.Shutdown()
+
+	checkLeafNodeConnected(t, s1)
+	checkLeafNodeConnected(t, ln)
+
+	// Now add a routed server to s1
+	o2 := DefaultOptions()
+	o2.Websocket.Host = "127.0.0.1"
+	o2.Websocket.Port = -1
+	o2.Websocket.NoTLS = true
+	o2.LeafNode.Host = "127.0.0.1"
+	o2.LeafNode.Port = -1
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	// Wait for cluster to form
+	checkClusterFormed(t, s1, s2)
+
+	// Now shutdown s1 and check that ln is able to reconnect to s2.
+	s1.Shutdown()
+
+	checkLeafNodeConnected(t, s2)
+	checkLeafNodeConnected(t, ln)
+
+	// Make sure that the reconnection was as a WS connection, not simply to
+	// the regular LN port.
+	var s2lc *client
+	s2.mu.Lock()
+	for _, l := range s2.leafs {
+		s2lc = l
+		break
+	}
+	s2.mu.Unlock()
+
+	s2lc.mu.Lock()
+	isWS := s2lc.isWebsocket()
+	s2lc.mu.Unlock()
+
+	if !isWS {
+		t.Fatal("Leafnode connection is not websocket!")
+	}
 }
