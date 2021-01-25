@@ -1024,7 +1024,10 @@ func (c *client) readLoop(pre []byte) {
 	// Last per-account-cache check for closed subscriptions
 	lpacc := time.Now()
 	acc := c.acc
-	isLeaf := c.kind == LEAF
+	var noMasking bool
+	if ws {
+		noMasking = c.ws.noMasking
+	}
 	c.mu.Unlock()
 
 	defer func() {
@@ -1050,8 +1053,7 @@ func (c *client) readLoop(pre []byte) {
 	if ws {
 		wsr = &wsReadInfo{}
 		wsr.init()
-		// No mask for LEAF connections
-		wsr.nm = isLeaf
+		wsr.nm = noMasking
 	}
 
 	for {

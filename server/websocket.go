@@ -78,12 +78,18 @@ const (
 
 	wsSchemePrefix    = "ws"
 	wsSchemePrefixTLS = "wss"
+
+	wsNoMaskingExtensionKey = "Nats-No-Masking"
+	wsNoMaskingExtensionVal = "1"
 )
 
 var decompressorPool sync.Pool
 
 // From https://tools.ietf.org/html/rfc6455#section-1.3
 var wsGUID = []byte("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+
+// Test can enable this so that server does not support "no-masking" requests.
+var wsTestRejectMasking = false
 
 type websocket struct {
 	frames     net.Buffers
@@ -92,6 +98,7 @@ type websocket struct {
 	compress   bool
 	closeSent  bool
 	browser    bool
+	noMasking  bool
 	compressor *flate.Writer
 	cookieJwt  string
 }
@@ -582,6 +589,9 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 	if compress {
 		compress = wsClientSupportsCompression(r.Header)
 	}
+	ws := &websocket{compress: compress}
+	// Check if the "client" requests no masking...
+	ws.noMasking = wsHeaderContains(r.Header, wsNoMaskingExtensionKey, wsNoMaskingExtensionVal)
 
 	h := w.(http.Hijacker)
 	conn, brw, err := h.Hijack()
@@ -606,6 +616,9 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 	if compress {
 		p = append(p, "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n"...)
 	}
+	if ws.noMasking && !wsTestRejectMasking {
+		p = append(p, fmt.Sprintf("%s: %s\r\n", wsNoMaskingExtensionKey, wsNoMaskingExtensionVal)...)
+	}
 	p = append(p, _CRLF_...)
 
 	if _, err = conn.Write(p); err != nil {
@@ -616,7 +629,6 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 	if opts.Websocket.HandshakeTimeout > 0 {
 		conn.SetDeadline(time.Time{})
 	}
-	ws := &websocket{compress: compress}
 	if kind == CLIENT {
 		// Indicate if this is likely coming from a browser.
 		if ua := r.Header.Get("User-Agent"); ua != "" && strings.HasPrefix(ua, "Mozilla/") {

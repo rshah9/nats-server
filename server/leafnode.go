@@ -677,7 +677,7 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 			// TODO: As a remote, we may want to have an option to decide if
 			// we want to use compression and not rely/force to have a websocket
 			// section with compression option configured.
-			c.ws = &websocket{compress: opts.Websocket.Compression}
+			c.ws = &websocket{compress: opts.Websocket.Compression, noMasking: true}
 		}
 	}
 
@@ -2024,6 +2024,7 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 	if opts.Websocket.Compression {
 		req.Header["Sec-WebSocket-Extensions"] = []string{"permessage-deflate; server_no_context_takeover; client_no_context_takeover"}
 	}
+	req.Header[wsNoMaskingExtensionKey] = []string{wsNoMaskingExtensionVal}
 	if err := req.Write(c.nc); err != nil {
 		return nil, WriteError, err
 	}
@@ -2049,6 +2050,11 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 			// No extension, or does not contain the indication that per-message
 			// compression is supported, so disable on our side.
 			c.ws.compress = false
+		}
+	}
+	if err == nil {
+		if ext := resp.Header.Get(wsNoMaskingExtensionKey); ext != wsNoMaskingExtensionVal {
+			err = fmt.Errorf("remote server does not support no-masking")
 		}
 	}
 	if resp != nil {
