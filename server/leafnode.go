@@ -19,7 +19,6 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -773,41 +772,19 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 		c.sendProtoNow(bytes.Join(pcs, []byte(" ")))
 
 		// The above call could have marked the connection as closed (due to TCP error).
-
-		// Check to see if we need to spin up TLS.
-		if !c.isClosed() && !c.isWebsocket() && info.TLSRequired {
-			c.Debugf("Starting TLS leafnode server handshake")
-			c.nc = tls.Server(c.nc, opts.LeafNode.TLSConfig)
-			conn := c.nc.(*tls.Conn)
-
-			// Setup the timeout
-			ttl := secondsToDuration(opts.LeafNode.TLSTimeout)
-			time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
-			conn.SetReadDeadline(time.Now().Add(ttl))
-
-			// Force handshake
-			c.mu.Unlock()
-			if err := conn.Handshake(); err != nil {
-				c.Errorf("TLS handshake error: %v", err)
-				c.closeConnection(TLSHandshakeError)
-				return nil
-			}
-			// Reset the read deadline
-			conn.SetReadDeadline(time.Time{})
-
-			// Re-Grab lock
-			c.mu.Lock()
-
-			// Indicate that handshake is complete (used in monitoring)
-			c.flags.set(handshakeComplete)
-		}
-
-		// Check if connection was closed either during the send of INFO or
-		// during the TLS handshake.
 		if c.isClosed() {
 			c.mu.Unlock()
 			c.closeConnection(WriteError)
 			return nil
+		}
+
+		// Check to see if we need to spin up TLS.
+		if !c.isWebsocket() && info.TLSRequired {
+			// Perform server-side TLS handshake.
+			if err := c.doTLSServerHandshake("leafnode", opts.LeafNode.TLSConfig, opts.LeafNode.TLSTimeout); err != nil {
+				c.mu.Unlock()
+				return nil
+			}
 		}
 
 		// Leaf nodes will always require a CONNECT to let us know
@@ -1958,6 +1935,36 @@ func (c *client) setLeafConnectDelayIfSoliciting(delay time.Duration) (string, t
 	return accName, delay
 }
 
+// For the given remote Leafnode configuration, this function returns
+// if TLS is required, and if so, will return a clone of the TLS Config
+// (since some fields will be changed during handshake), the TLS server
+// name that is remembered, and the TLS timeout.
+func (c *client) leafNodeGetTLSConfigForSolicit(remote *leafNodeCfg) (bool, *tls.Config, string, float64) {
+	var (
+		tlsConfig  *tls.Config
+		tlsName    string
+		tlsTimeout float64
+	)
+
+	remote.RLock()
+	tlsRequired := remote.TLS || remote.TLSConfig != nil
+	if tlsRequired {
+		if remote.TLSConfig != nil {
+			tlsConfig = remote.TLSConfig.Clone()
+		} else {
+			tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		tlsName = remote.tlsName
+		tlsTimeout = remote.TLSTimeout
+		if tlsTimeout == 0 {
+			tlsTimeout = float64(TLS_TIMEOUT / time.Second)
+		}
+	}
+	remote.RUnlock()
+
+	return tlsRequired, tlsConfig, tlsName, tlsTimeout
+}
+
 // Initiates the LeafNode Websocket connection by:
 // - doing the TLS handshake if needed
 // - sending the HTTP request
@@ -1971,12 +1978,16 @@ func (c *client) setLeafConnectDelayIfSoliciting(delay time.Duration) (string, t
 // Lock held on entry.
 func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remote *leafNodeCfg) ([]byte, ClosedState, error) {
 	// Do TLS here as needed.
-	remote.RLock()
-	remoteTLSConfig := remote.TLSConfig
-	tlsRequired := remote.TLS || remoteTLSConfig != nil
-	remote.RUnlock()
+	tlsRequired, tlsConfig, tlsName, tlsTimeout := c.leafNodeGetTLSConfigForSolicit(remote)
 	if tlsRequired {
-		if err := c.doLeafNodeTLSClientHandshake(remoteTLSConfig); err != nil {
+		// Perform the client-side TLS handshake.
+		if resetTLSName, err := c.doTLSClientHandshake("leafnode", rURL, tlsConfig, tlsName, tlsTimeout); err != nil {
+			// Check if we need to reset the remote's TLS name.
+			if resetTLSName {
+				remote.Lock()
+				remote.tlsName = _EMPTY_
+				remote.Unlock()
+			}
 			// 0 will indicate that the connection was already closed
 			return nil, 0, err
 		}
@@ -2085,20 +2096,39 @@ func (s *Server) leafNodeFinishConnectProcess(c *client) {
 	}
 	remote := c.leaf.remote
 
-	// Check if we will need to send the system connect event and if TLS is required.
+	// Check if we will need to send the system connect event.
 	remote.RLock()
 	sendSysConnectEvent := remote.Hub
-	remoteTLSConfig := remote.TLSConfig
-	// For websocket connections, the TLS handshake was already done.
-	tlsRequired := !c.isWebsocket() && (remote.TLS || remoteTLSConfig != nil)
 	remote.RUnlock()
 
-	// If not a websocket connection and if TLS is required, do the TLS handshake
-	if tlsRequired {
-		if err := c.doLeafNodeTLSClientHandshake(remoteTLSConfig); err != nil {
-			// The connection was already closed, so simply return.
-			c.mu.Unlock()
-			return
+	var tlsRequired bool
+
+	// In case of websocket, the TLS handshake has been already done.
+	// So check only for non websocket connections.
+	if !c.isWebsocket() {
+		var tlsConfig *tls.Config
+		var tlsName string
+		var tlsTimeout float64
+
+		// Check if TLS is required and gather TLS config variables.
+		tlsRequired, tlsConfig, tlsName, tlsTimeout = c.leafNodeGetTLSConfigForSolicit(remote)
+
+		// If TLS required, peform handshake.
+		if tlsRequired {
+			// Get the URL that was used to connect to the remote server.
+			rURL := remote.getCurrentURL()
+
+			// Perform the client-side TLS handshake.
+			if resetTLSName, err := c.doTLSClientHandshake("leafnode", rURL, tlsConfig, tlsName, tlsTimeout); err != nil {
+				// Check if we need to reset the remote's TLS name.
+				if resetTLSName {
+					remote.Lock()
+					remote.tlsName = _EMPTY_
+					remote.Unlock()
+				}
+				c.mu.Unlock()
+				return
+			}
 		}
 	}
 	if err := c.sendLeafConnect(clusterName, tlsRequired, c.headers); err != nil {
@@ -2143,80 +2173,6 @@ func (s *Server) leafNodeFinishConnectProcess(c *client) {
 			s.decActiveAccounts()
 		}
 	}
-}
-
-// Performs the client side TLS handshake for this remote LEAF connection.
-// Lock is held on entry (but will be released and reacquired in this function).
-func (c *client) doLeafNodeTLSClientHandshake(remoteTLSConfig *tls.Config) error {
-	remote := c.leaf.remote
-
-	c.Debugf("Starting TLS leafnode client handshake")
-	// Specify the ServerName we are expecting.
-	var tlsConfig *tls.Config
-	if remoteTLSConfig != nil {
-		tlsConfig = remoteTLSConfig.Clone()
-	} else {
-		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	}
-
-	var host string
-	// If ServerName was given to us from the option, use that, always.
-	if tlsConfig.ServerName == "" {
-		url := remote.getCurrentURL()
-		host = url.Hostname()
-		// We need to check if this host is an IP. If so, we probably
-		// had this advertised to us and should use the configured host
-		// name for the TLS server name.
-		if remote.tlsName != "" && net.ParseIP(host) != nil {
-			host = remote.tlsName
-		}
-		tlsConfig.ServerName = host
-	}
-
-	c.nc = tls.Client(c.nc, tlsConfig)
-
-	conn := c.nc.(*tls.Conn)
-
-	// Setup the timeout
-	var wait time.Duration
-	if remote.TLSTimeout == 0 {
-		wait = TLS_TIMEOUT
-	} else {
-		wait = secondsToDuration(remote.TLSTimeout)
-	}
-	time.AfterFunc(wait, func() { tlsTimeout(c, conn) })
-	conn.SetReadDeadline(time.Now().Add(wait))
-
-	// Force handshake
-	c.mu.Unlock()
-	var err error
-	if err = conn.Handshake(); err != nil {
-		// If we overrode and used the saved tlsName but that failed
-		// we will clear that here. This is for the case that another server
-		// does not have the same tlsName, maybe only IPs.
-		// https://github.com/nats-io/nats-server/issues/1256
-		if _, ok := err.(x509.HostnameError); ok {
-			remote.Lock()
-			if host == remote.tlsName {
-				remote.tlsName = ""
-			}
-			remote.Unlock()
-		}
-		c.Errorf("TLS handshake error: %v", err)
-		c.closeConnection(TLSHandshakeError)
-	}
-	// Regrab the lock now
-	c.mu.Lock()
-
-	// If closed during handshake, return now.
-	if c.isClosed() {
-		return err
-	}
-
-	// Reset the read deadline
-	conn.SetReadDeadline(time.Time{})
-
-	return nil
 }
 
 func wsMakeChallengeKey() (string, error) {
